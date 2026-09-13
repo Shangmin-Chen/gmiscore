@@ -9,4 +9,4 @@ B2C: user GitHub OAuth → GraphQL on `viewer` → raw JSON. Pipeline is Ingest 
 
 **STAGE is `ingest`.** Implement against `spec/ingest.md` only. Do not add GitHub Apps, webhooks, Search, Events, ETL, or scores.
 
-Persist GitHub payloads as returned. `contributionCalendar` is `not_a_signal`. Do not write `is_docs_only` or merge identities. Never commit `.env` or `GITHUB_CLIENT_SECRET`.
+Persist GitHub payloads as returned. `contributionCalendar` is `not_a_signal`. Do not write `is_docs_only` or merge identities.

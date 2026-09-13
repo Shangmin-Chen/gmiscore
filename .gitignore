@@ -1,6 +1,0 @@
-.env
-.env.local
-*.pem
-.data/
-node_modules/
-dist/
