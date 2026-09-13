@@ -1,0 +1,12 @@
+---
+description: GMI Score stage gate and ingest boundary
+alwaysApply: true
+---
+
+# GMI Score
+
+B2C: user GitHub OAuth → GraphQL on `viewer` → raw JSON. Pipeline is Ingest → ETL → Core. Scoring only in Core. First path is output (later).
+
+**STAGE is `ingest`.** Implement against `spec/ingest.md` only. Do not add GitHub Apps, webhooks, Search, Events, ETL, or scores.
+
+Persist GitHub payloads as returned. `contributionCalendar` is `not_a_signal`. Do not write `is_docs_only` or merge identities.
