@@ -1,14 +1,12 @@
 ---
-description: GMI Score architecture, stage gate, and ingest boundaries
+description: GMI Score stage gate and ingest boundary
 alwaysApply: true
 ---
 
 # GMI Score
 
-Contribution graphs are not engineer quality. Pipeline is GitHub → Ingest → ETL → Core. Scoring and path composition happen **only in Core**. First path is **output** (later spec).
+B2C: user GitHub OAuth → GraphQL on `viewer` → raw JSON. Pipeline is Ingest → ETL → Core. Scoring only in Core. First path is output (later).
 
-**STAGE is `ingest`.** Read `spec/STAGE.md` and `spec/ingest/`. Do not implement ETL, Core, or scoring. Do not add derived fields like `is_docs_only`, identity merges, graphs, or counts-as-metrics in ingest.
+**STAGE is `ingest`.** Implement against `spec/ingest.md` only. Do not add GitHub Apps, webhooks, Search, Events, ETL, or scores.
 
-Ingest run key is `(installation, repo, resource, watermark)` — **do not subject-filter GitHub list queries**. Webhooks notify; refetch is canonical. List-then-hydrate. Identity linking is ETL. Record `truncated_by_api`, `legal_basis`, and `body_stored` on every envelope. Fetch contract: `spec/ingest/fetch.md`.
-
-A path reads canonical facts and emits `PathResult { path_id, score|null, confidence, coverage, evidence }`. Paths do not call GitHub or each other.
+Persist GitHub payloads as returned. `contributionCalendar` is `not_a_signal`. Do not write `is_docs_only` or merge identities.

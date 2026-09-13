@@ -1,34 +1,25 @@
 # Specs
 
-This folder is the source of truth for **what we are building and which stage the codebase is in**. Code follows STAGE. Agents must read `STAGE.md` before implementing.
+Source of truth for what we are building and which **stage** the codebase is in. Code follows `STAGE.md`.
 
 ## Current stage
 
-See `STAGE.md`. Right now that is **ingest**.
+**ingest** — GitHub OAuth, then GraphQL on `viewer`, persist raw JSON. See `ingest.md`.
 
-## Pipeline (repo-local reminder)
+## Pipeline
 
 ```
-GitHub → Ingest → ETL → Core
+GitHub OAuth → Ingest (this stage) → ETL → Core (paths, first path = output)
 ```
 
-- **Ingest** — fetch and persist raw GitHub payloads. No scoring.
-- **ETL** — transform payloads into canonical facts. No scoring. Not started.
-- **Core** — independent scoring paths plus a later combiner. First path: Output. Not started.
-
-Architecture reminder: `.cursor/rules/gmiscore.mdc`. Ingest details in this folder win over memory if they ever drift. This folder’s first real spec is ingest, not Core.
+Scoring happens only in Core. Ingest does not score. ETL is not started.
 
 ## Layout
 
 | Path | Status |
 |---|---|
-| `STAGE.md` | Active — single line of stage truth |
-| `ingest/` | Active — v1 ingest spec |
-| ETL spec | Not started — do not implement |
-| Core / path specs | Not started — do not implement |
+| `STAGE.md` | `ingest` |
+| `ingest.md` | v1 ingest — implement against this file only |
+| ETL / Core / paths | Not started |
 
-## Rules for later agents
-
-- A PR that computes a score while STAGE=`ingest` is spec-invalid.
-- Do not “helpfully” skip ingest completeness because Output formulas are unknown. If Output will need file paths, ingest file paths.
-- Deferred decisions live in `ingest/open-decisions.md`. Do not silently lock them in code.
+Do not add scoring code while STAGE is `ingest`.
