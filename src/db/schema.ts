@@ -24,6 +24,10 @@ export interface IngestRunRow {
   started_at: string;
   finished_at: string | null;
   heartbeat_at: string;
+  window_start: string | null;
+  hydrate_pr_ids: string | null;
+  q9_pr_ids: string | null;
+  q13_pr_ids: string | null;
 }
 
 export interface IngestResponseRow {
@@ -60,6 +64,23 @@ function migrateSchema(db: DatabaseSync): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_runs_one_running_per_user
       ON ingest_runs(user_id) WHERE status = 'running'
   `);
+
+  const runColsAfter = db.prepare("PRAGMA table_info(ingest_runs)").all() as Array<{
+    name: string;
+  }>;
+  const runColNames = new Set(runColsAfter.map((c) => c.name));
+  if (!runColNames.has("window_start")) {
+    db.exec(`ALTER TABLE ingest_runs ADD COLUMN window_start TEXT`);
+  }
+  if (!runColNames.has("hydrate_pr_ids")) {
+    db.exec(`ALTER TABLE ingest_runs ADD COLUMN hydrate_pr_ids TEXT`);
+  }
+  if (!runColNames.has("q9_pr_ids")) {
+    db.exec(`ALTER TABLE ingest_runs ADD COLUMN q9_pr_ids TEXT`);
+  }
+  if (!runColNames.has("q13_pr_ids")) {
+    db.exec(`ALTER TABLE ingest_runs ADD COLUMN q13_pr_ids TEXT`);
+  }
 }
 
 export const ZOMBIE_RUN_MS = 30 * 60 * 1000;
