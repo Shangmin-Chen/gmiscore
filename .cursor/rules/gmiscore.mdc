@@ -7,6 +7,6 @@ alwaysApply: true
 
 B2C: user GitHub OAuth → GraphQL on `viewer` → raw JSON. Pipeline is Ingest → ETL → Core. Scoring only in Core. First path is output (later).
 
-**STAGE is `ingest`.** Implement against `spec/ingest.md` only. Do not add GitHub Apps, webhooks, Search, Events, ETL, or scores.
+**STAGE is `ingest`.** Implement against `spec/ingest.md` only. Do not add GitHub Apps, webhooks, Search, Events, REST, ETL, or scores.
 
-Persist GitHub payloads as returned. `contributionCalendar` is `not_a_signal`. Do not write `is_docs_only` or merge identities.
+Persist GitHub payloads as returned. Do not fetch `contributionCalendar` or commits. Do not write `is_docs_only` or merge identities. Never commit `.env` or `GITHUB_CLIENT_SECRET`.
