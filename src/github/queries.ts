@@ -1,5 +1,4 @@
-export const FRAGMENTS = `
-fragment Actor on Actor {
+export const ACTOR_FRAGMENT = `fragment Actor on Actor {
   __typename
   login
   ... on User { id databaseId }
@@ -7,23 +6,22 @@ fragment Actor on Actor {
   ... on EnterpriseUserAccount { id }
   ... on Mannequin { id databaseId }
   ... on Organization { id databaseId }
-}
+}`;
 
-fragment GitActor on GitActor {
-  name
-  email
-  date
-  user { id databaseId login }
-}
-
-fragment Page on PageInfo {
+export const PAGE_FRAGMENT = `fragment Page on PageInfo {
   hasNextPage
   endCursor
-}
-`;
+}`;
 
-export const Q1_VIEWER_PROFILE = `
-${FRAGMENTS}
+/** GitHub errors with useAndDefineFragment if a fragment is defined but unused. */
+function withUsedFragments(query: string): string {
+  const parts: string[] = [];
+  if (/\.\.\.Actor\b/.test(query)) parts.push(ACTOR_FRAGMENT);
+  if (/\.\.\.Page\b/.test(query)) parts.push(PAGE_FRAGMENT);
+  return `${parts.join("\n\n")}${parts.length ? "\n" : ""}${query}`;
+}
+
+export const Q1_VIEWER_PROFILE = withUsedFragments(`
 query ViewerProfile {
   viewer {
     id
@@ -34,10 +32,9 @@ query ViewerProfile {
     createdAt
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q2_VIEWER_PULL_REQUESTS = `
-${FRAGMENTS}
+export const Q2_VIEWER_PULL_REQUESTS = withUsedFragments(`
 query ViewerPullRequests($after: String) {
   viewer {
     pullRequests(
@@ -72,10 +69,9 @@ query ViewerPullRequests($after: String) {
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q3_VIEWER_ISSUE_COMMENTS = `
-${FRAGMENTS}
+export const Q3_VIEWER_ISSUE_COMMENTS = withUsedFragments(`
 query ViewerIssueComments($after: String) {
   viewer {
     issueComments(first: 100, after: $after, orderBy: { field: UPDATED_AT, direction: DESC }) {
@@ -95,48 +91,36 @@ query ViewerIssueComments($after: String) {
           url
           repository { id nameWithOwner owner { login } name isPrivate }
         }
+        pullRequest {
+          id
+          number
+          url
+          author { ...Actor }
+          repository { id nameWithOwner isPrivate }
+        }
       }
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q4_CONTRIBUTION_YEARS = `
-query ContributionYears {
-  viewer {
-    contributionsCollection {
-      contributionYears
-    }
-  }
-  rateLimit { cost remaining resetAt }
-}`;
-
-export const Q4_CONTRIB_YEAR = `
-${FRAGMENTS}
-query ContribYear($from: DateTime!, $to: DateTime!, $reviewAfter: String) {
+export const Q4_REVIEW_CONTRIB_SLICE = withUsedFragments(`
+query ReviewContribSlice($from: DateTime!, $to: DateTime!, $reviewAfter: String) {
   viewer {
     contributionsCollection(from: $from, to: $to) {
       startedAt
       endedAt
-      contributionCalendar {
-        totalContributions
-        weeks { contributionDays { date contributionCount contributionLevel } }
-      }
-      totalCommitContributions
-      totalPullRequestContributions
-      totalPullRequestReviewContributions
       restrictedContributionsCount
-      commitContributionsByRepository(maxRepositories: 100) {
-        repository { id nameWithOwner owner { login } name isPrivate }
-        contributions(first: 1) {
-          totalCount
-        }
-      }
-      pullRequestReviewContributions(first: 100, after: $reviewAfter) {
+      pullRequestReviewContributions(
+        first: 100
+        after: $reviewAfter
+        orderBy: { direction: DESC }
+      ) {
         pageInfo { ...Page }
         nodes {
           occurredAt
-          pullRequest { id number url }
+          isRestricted
+          pullRequest { id number url author { ...Actor } }
           pullRequestReview { id state submittedAt }
           repository { id nameWithOwner }
         }
@@ -144,17 +128,17 @@ query ContribYear($from: DateTime!, $to: DateTime!, $reviewAfter: String) {
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q5_VIEWER_ISSUES = `
-${FRAGMENTS}
-query ViewerIssues($after: String) {
+export const Q5_VIEWER_ISSUES = withUsedFragments(`
+query ViewerIssues($after: String, $login: String!) {
   viewer {
     issues(
       first: 100
       after: $after
       states: [OPEN, CLOSED]
-      orderBy: { field: UPDATED_AT, direction: DESC }
+      filterBy: { createdBy: $login }
+      orderBy: { field: CREATED_AT, direction: DESC }
     ) {
       totalCount
       pageInfo { ...Page }
@@ -167,18 +151,18 @@ query ViewerIssues($after: String) {
         state
         createdAt
         closedAt
+        updatedAt
         repository { id nameWithOwner isPrivate }
         author { ...Actor }
       }
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q6_PR_CORE = `
-${FRAGMENTS}
-query PrCore($id: ID!) {
-  node(id: $id) {
+export const Q6_PR_CORE_BATCH = withUsedFragments(`
+query PrCoreBatch($ids: [ID!]!) {
+  nodes(ids: $ids) {
     ... on PullRequest {
       id
       number
@@ -196,20 +180,39 @@ query PrCore($id: ID!) {
       changedFiles
       baseRefName
       headRefName
-      repository { id nameWithOwner isPrivate isFork }
-      author { ...Actor }
-      mergedBy { ...Actor }
       body
       reviewDecision
       mergeCommit { oid }
       statusCheckRollup { state }
+      labels(first: 20) {
+        pageInfo { hasNextPage }
+        nodes { name }
+      }
+      repository { id nameWithOwner isPrivate isFork }
+      author { ...Actor }
+      mergedBy { ...Actor }
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q7_PR_FILES = `
-${FRAGMENTS}
+export const Q7_PR_FILES_BATCH = withUsedFragments(`
+query PrFilesBatch($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on PullRequest {
+      id
+      changedFiles
+      files(first: 50) {
+        totalCount
+        pageInfo { ...Page }
+        nodes { path additions deletions changeType }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}`);
+
+export const Q7_PR_FILES = withUsedFragments(`
 query PrFiles($id: ID!, $after: String) {
   node(id: $id) {
     ... on PullRequest {
@@ -222,143 +225,77 @@ query PrFiles($id: ID!, $after: String) {
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q8_PR_COMMITS = `
-${FRAGMENTS}
-query PrCommits($id: ID!, $after: String) {
-  node(id: $id) {
+export const Q9_PR_COMMENTS_BATCH = withUsedFragments(`
+query PrCommentsBatch($ids: [ID!]!) {
+  nodes(ids: $ids) {
     ... on PullRequest {
-      commits(first: 50, after: $after) {
-        totalCount
-        pageInfo { ...Page }
+      id
+      comments(first: 50, orderBy: { field: UPDATED_AT, direction: DESC }) {
+        pageInfo { hasNextPage }
         nodes {
-          commit {
-            oid
-            messageHeadline
-            messageBody
-            authoredDate
-            committedDate
-            author { ...GitActor }
-            committer { ...GitActor }
-            additions
-            deletions
-            changedFilesIfAvailable
-            parents { oid }
-          }
-        }
-      }
-    }
-  }
-  rateLimit { cost remaining resetAt }
-}`;
-
-export const Q9_PR_COMMENTS = `
-${FRAGMENTS}
-query PrComments($id: ID!, $after: String) {
-  node(id: $id) {
-    ... on PullRequest {
-      comments(first: 50, after: $after) {
-        pageInfo { ...Page }
-        nodes {
-          id createdAt updatedAt body
+          id
+          createdAt
+          updatedAt
+          body
           author { ...Actor }
         }
       }
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q10_PR_REVIEWS = `
-${FRAGMENTS}
-query PrReviews($id: ID!, $after: String) {
-  node(id: $id) {
-    ... on PullRequest {
-      reviews(first: 50, after: $after) {
-        pageInfo { ...Page }
-        nodes {
-          id state submittedAt body
-          author { ...Actor }
-          commit { oid }
-        }
-      }
-    }
-  }
-  rateLimit { cost remaining resetAt }
-}`;
-
-export const Q11_PR_THREADS = `
-${FRAGMENTS}
-query PrThreads($id: ID!, $after: String) {
-  node(id: $id) {
-    ... on PullRequest {
-      reviewThreads(first: 50, after: $after) {
-        pageInfo { ...Page }
-        nodes {
-          id isResolved isOutdated path line
-          comments(first: 50) {
-            pageInfo { ...Page }
-            nodes {
-              id createdAt body
-              author { ...Actor }
-            }
-          }
-        }
-      }
-    }
-  }
-  rateLimit { cost remaining resetAt }
-}`;
-
-export const Q11_THREAD_COMMENTS = `
-${FRAGMENTS}
-query ThreadComments($threadId: ID!, $after: String) {
-  node(id: $threadId) {
-    ... on PullRequestReviewThread {
-      comments(first: 50, after: $after) {
-        pageInfo { ...Page }
-        nodes {
-          id createdAt body
-          author { ...Actor }
-        }
-      }
-    }
-  }
-  rateLimit { cost remaining resetAt }
-}`;
-
-export const Q12_ISSUE_OR_PR = `
-${FRAGMENTS}
+export const Q12_ISSUE_OR_PR = withUsedFragments(`
 query IssueOrPr($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      id number url title state merged mergedAt
+      id
+      number
+      url
+      title
+      state
+      merged
+      mergedAt
       author { ...Actor }
       repository { id nameWithOwner isPrivate }
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q13_REVIEWS_BY_AUTHOR = `
-${FRAGMENTS}
+export const Q13_REVIEWS_BY_AUTHOR = withUsedFragments(`
 query ReviewsByAuthor($id: ID!, $login: String!, $after: String) {
   node(id: $id) {
     ... on PullRequest {
-      id number url
+      id
+      number
+      url
       author { ...Actor }
       repository { id nameWithOwner isPrivate }
-      reviews(first: 50, after: $after, author: $login) {
+      reviews(
+        first: 50
+        after: $after
+        author: $login
+        states: [APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED]
+      ) {
         pageInfo { ...Page }
         nodes {
-          id state submittedAt body
+          id
+          state
+          submittedAt
+          body
           author { ...Actor }
           commit { oid }
           comments(first: 50) {
-            pageInfo { ...Page }
+            pageInfo { hasNextPage }
             nodes {
-              id createdAt path originalCommit { oid } body
+              id
+              createdAt
+              path
+              originalCommit { oid }
+              body
               author { ...Actor }
             }
           }
@@ -367,56 +304,24 @@ query ReviewsByAuthor($id: ID!, $login: String!, $after: String) {
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
+}`);
 
-export const Q13_REVIEW_COMMENTS = `
-${FRAGMENTS}
+export const Q13_REVIEW_COMMENTS = withUsedFragments(`
 query ReviewComments($reviewId: ID!, $after: String) {
   node(id: $reviewId) {
     ... on PullRequestReview {
       comments(first: 50, after: $after) {
         pageInfo { ...Page }
         nodes {
-          id createdAt path originalCommit { oid } body
+          id
+          createdAt
+          path
+          originalCommit { oid }
+          body
           author { ...Actor }
         }
       }
     }
   }
   rateLimit { cost remaining resetAt }
-}`;
-
-export const Q14_REPO_AUTHOR_HISTORY = `
-${FRAGMENTS}
-query RepoAuthorHistory($owner: String!, $name: String!, $authorId: ID!, $after: String) {
-  repository(owner: $owner, name: $name) {
-    id
-    nameWithOwner
-    defaultBranchRef {
-      name
-      target {
-        ... on Commit {
-          history(first: 50, after: $after, author: { id: $authorId }) {
-            pageInfo { ...Page }
-            nodes {
-              oid
-              messageHeadline
-              messageBody
-              authoredDate
-              committedDate
-              author { ...GitActor }
-              committer { ...GitActor }
-              additions
-              deletions
-              changedFilesIfAvailable
-              associatedPullRequests(first: 5) {
-                nodes { id number url }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  rateLimit { cost remaining resetAt }
-}`;
+}`);

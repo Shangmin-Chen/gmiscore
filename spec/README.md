@@ -4,7 +4,7 @@ Source of truth for what we are building and which **stage** the codebase is in.
 
 ## Current stage
 
-**ingest** — GitHub OAuth, then GraphQL on `viewer`, persist raw JSON. See `ingest.md`.
+**ingest** — GitHub OAuth, then GraphQL on `viewer`, persist raw JSON. Keep-list is PRs, files, issues, comments, and reviews they wrote — not commits or the contribution graph. See `ingest.md`.
 
 ## Pipeline
 

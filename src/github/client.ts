@@ -2,12 +2,16 @@ import type { Store } from "../db/store.js";
 
 export interface GraphQLResult {
   data?: Record<string, unknown>;
-  errors?: Array<{ message: string; [key: string]: unknown }>;
+  errors?: Array<{ message: string; type?: string; [key: string]: unknown }>;
   rateLimit?: { cost: number; remaining: number; resetAt: string };
 }
 
-/** Chunk long rate-limit sleeps so ingest heartbeat stays fresh (< zombie cutoff). */
+/** Chunk long secondary-rate-limit sleeps so ingest heartbeat stays fresh. */
 export const RATE_LIMIT_SLEEP_CHUNK_MS = 60_000;
+
+export const REMAINING_FLOOR = 200;
+export const MAX_IN_FLIGHT = 2;
+export const SECONDARY_BACKOFF_MS = [60_000, 120_000, 240_000] as const;
 
 export interface GitHubClientOptions {
   accessToken: string;
@@ -19,16 +23,64 @@ export interface GitHubClientOptions {
 
 const PAGED_CONNECTION_FIELDS = [
   "pullRequestReviewContributions",
-  "history",
   "files",
-  "commits",
   "comments",
   "reviews",
-  "reviewThreads",
   "pullRequests",
   "issueComments",
   "issues",
 ] as const;
+
+export type ErrorClassification =
+  | "success"
+  | "primary_rate_limit"
+  | "secondary_rate_limit"
+  | "validation_1year"
+  | "null_data"
+  | "partial_data"
+  | "http_error"
+  | "timeout";
+
+export interface GraphQLAttempt {
+  httpStatus: number;
+  body: GraphQLResult & Record<string, unknown>;
+  headerRemaining: number | undefined;
+  retryAfterMs: number | undefined;
+  classification: ErrorClassification;
+}
+
+export interface RequestOutcome {
+  success: boolean;
+  httpStatus: number;
+  payload: unknown;
+  classification: ErrorClassification;
+  stoppedRemainingFloor?: boolean;
+  secondaryExhausted?: boolean;
+}
+
+class Semaphore {
+  private inFlight = 0;
+  private queue: Array<() => void> = [];
+
+  constructor(private max: number) {}
+
+  async acquire(): Promise<void> {
+    if (this.inFlight < this.max) {
+      this.inFlight++;
+      return;
+    }
+    return new Promise((resolve) => this.queue.push(resolve));
+  }
+
+  release(): void {
+    this.inFlight--;
+    const next = this.queue.shift();
+    if (next) {
+      this.inFlight++;
+      next();
+    }
+  }
+}
 
 export function extractConnectionFirst(
   query: string,
@@ -79,11 +131,101 @@ function applyFirstToQuery(
   return query;
 }
 
+function isSecondaryRateLimitMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("secondary rate limit") ||
+    lower.includes("you have exceeded a secondary rate limit") ||
+    lower.includes("abuse detection")
+  );
+}
+
+function hasOneYearValidationError(body: GraphQLResult): boolean {
+  if (!Array.isArray(body.errors)) return false;
+  return body.errors.some(
+    (e) =>
+      e.type === "VALIDATION" &&
+      e.message.toLowerCase().includes("must not exceed 1 year"),
+  );
+}
+
+export function isPrimaryRateLimit(
+  httpStatus: number,
+  body: GraphQLResult,
+  headerRemaining: number | undefined,
+): boolean {
+  if (![200, 403, 429].includes(httpStatus)) return false;
+  if (headerRemaining === 0) return true;
+  if (!Array.isArray(body.errors)) return false;
+  return body.errors.some(
+    (e) => e.type === "RATE_LIMITED" || e.type === "RATE_LIMIT",
+  );
+}
+
+export function isSecondaryRateLimit(
+  httpStatus: number,
+  body: GraphQLResult,
+  headerRemaining: number | undefined,
+): boolean {
+  if (![200, 403, 429].includes(httpStatus)) return false;
+  if (headerRemaining == null || headerRemaining <= 0) return false;
+  const messages = (body.errors ?? []).map((e) => e.message).join(" ");
+  return isSecondaryRateLimitMessage(messages);
+}
+
+function classifyResponse(
+  httpStatus: number,
+  body: GraphQLResult,
+  headerRemaining: number | undefined,
+): ErrorClassification {
+  if (isPrimaryRateLimit(httpStatus, body, headerRemaining)) {
+    return "primary_rate_limit";
+  }
+  if (hasOneYearValidationError(body)) {
+    return "validation_1year";
+  }
+  if (isSecondaryRateLimit(httpStatus, body, headerRemaining)) {
+    return "secondary_rate_limit";
+  }
+  if (httpStatus === 502 || httpStatus === 504) {
+    return "timeout";
+  }
+  if (httpStatus >= 400) {
+    return "http_error";
+  }
+  if (body.data == null) {
+    return "null_data";
+  }
+  if (Array.isArray(body.errors) && body.errors.length > 0) {
+    return "partial_data";
+  }
+  return "success";
+}
+
+function parseRetryAfterMs(response: Response): number | undefined {
+  const raw = response.headers.get("Retry-After");
+  if (!raw) return undefined;
+  const seconds = parseInt(raw, 10);
+  if (!Number.isNaN(seconds)) return seconds * 1000;
+  const dateMs = Date.parse(raw);
+  if (!Number.isNaN(dateMs)) return Math.max(0, dateMs - Date.now());
+  return undefined;
+}
+
+function nodesFieldIsNull(body: GraphQLResult): boolean {
+  const data = body.data;
+  if (data == null || typeof data !== "object") return false;
+  return (data as Record<string, unknown>).nodes === null;
+}
+
 export class GitHubClient {
   private fetchImpl: typeof fetch;
   private sleep: (ms: number) => Promise<void>;
   private store?: Store;
   private ingestRunId?: number;
+  private semaphore = new Semaphore(MAX_IN_FLIGHT);
+  lastHeaderRemaining: number | undefined;
+  afterQ1 = false;
 
   constructor(
     private accessToken: string,
@@ -104,13 +246,25 @@ export class GitHubClient {
     this.ingestRunId = ingestRunId;
   }
 
+  markAfterQ1(): void {
+    this.afterQ1 = true;
+  }
+
+  shouldStopForRemainingFloor(): boolean {
+    return (
+      this.afterQ1 &&
+      this.lastHeaderRemaining != null &&
+      this.lastHeaderRemaining < REMAINING_FLOOR
+    );
+  }
+
   private touchHeartbeat(): void {
     if (this.store && this.ingestRunId != null) {
       this.store.touchIngestRunHeartbeat(this.ingestRunId);
     }
   }
 
-  private async chunkedSleep(totalMs: number): Promise<void> {
+  async chunkedSleep(totalMs: number): Promise<void> {
     if (totalMs <= 0) return;
     let remaining = totalMs;
     while (remaining > 0) {
@@ -134,44 +288,69 @@ export class GitHubClient {
     };
   }
 
-  private extractRateLimit(payload: unknown): GraphQLResult["rateLimit"] {
-    if (!payload || typeof payload !== "object") return undefined;
-    const data = payload as Record<string, unknown>;
-    const inner = data.data as Record<string, unknown> | undefined;
-    const rl = data.rateLimit ?? inner?.rateLimit;
-    if (rl && typeof rl === "object") {
-      return rl as { cost: number; remaining: number; resetAt: string };
-    }
-    return undefined;
+  private parseHeaderRemaining(response: Response): number | undefined {
+    const raw = response.headers.get("x-ratelimit-remaining");
+    if (raw == null) return undefined;
+    const n = parseInt(raw, 10);
+    return Number.isNaN(n) ? undefined : n;
   }
 
-  private async waitForRateLimit(remaining: number, resetAt: string): Promise<void> {
-    if (remaining >= 100) return;
-    const resetMs = new Date(resetAt).getTime();
-    const waitMs = Math.max(0, resetMs - Date.now() + 1000);
-    await this.chunkedSleep(waitMs);
+  private updateRemaining(headerRemaining: number | undefined, body: GraphQLResult): void {
+    if (headerRemaining != null) {
+      this.lastHeaderRemaining = headerRemaining;
+      return;
+    }
+    const rl = body.rateLimit ?? (body.data as Record<string, unknown> | undefined)?.rateLimit;
+    if (rl && typeof rl === "object" && "remaining" in rl) {
+      this.lastHeaderRemaining = (rl as { remaining: number }).remaining;
+    }
   }
 
-  private async waitForHttpRateLimit(response: Response): Promise<void> {
-    if (response.status !== 403 && response.status !== 429) return;
-    const retryAfter = response.headers.get("Retry-After");
-    if (retryAfter) {
-      const seconds = parseInt(retryAfter, 10);
-      if (!Number.isNaN(seconds)) {
-        await this.chunkedSleep(seconds * 1000);
-        return;
+  async rawGraphql(
+    query: string,
+    variables: Record<string, unknown> = {},
+    options: {
+      first?: number;
+      retried502?: boolean;
+      connectionField?: string;
+    } = {},
+  ): Promise<GraphQLAttempt> {
+    await this.semaphore.acquire();
+    try {
+      const connectionField = options.connectionField;
+      let effectiveQuery = query;
+      if (options.first !== undefined && connectionField) {
+        effectiveQuery = applyFirstToQuery(query, connectionField, options.first);
       }
-    }
-    const resetHeader = response.headers.get("X-RateLimit-Reset");
-    if (resetHeader) {
-      const resetSec = parseInt(resetHeader, 10);
-      if (!Number.isNaN(resetSec)) {
-        const waitMs = Math.max(0, resetSec * 1000 - Date.now() + 1000);
-        await this.chunkedSleep(waitMs);
-        return;
+
+      const response = await this.fetchImpl("https://api.github.com/graphql", {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({ query: effectiveQuery, variables }),
+      });
+
+      const headerRemaining = this.parseHeaderRemaining(response);
+      const retryAfterMs = parseRetryAfterMs(response);
+      let body: GraphQLResult & Record<string, unknown>;
+
+      if (response.status === 502 || response.status === 504) {
+        body = { data: undefined };
+      } else {
+        body = (await response.json()) as GraphQLResult & Record<string, unknown>;
       }
+
+      this.updateRemaining(headerRemaining, body);
+
+      return {
+        httpStatus: response.status,
+        body,
+        headerRemaining,
+        retryAfterMs,
+        classification: classifyResponse(response.status, body, headerRemaining),
+      };
+    } finally {
+      this.semaphore.release();
     }
-    await this.chunkedSleep(2000);
   }
 
   async graphql(
@@ -181,144 +360,225 @@ export class GitHubClient {
       first?: number;
       retried502?: boolean;
       connectionField?: string;
+      secondaryAttempt?: number;
     } = {},
   ): Promise<{ httpStatus: number; body: GraphQLResult & Record<string, unknown> }> {
     const connectionField = options.connectionField;
     const first =
-      options.first ??
-      extractFirstFromQuery(query, connectionField);
-    const effectiveQuery =
-      first !== undefined
-        ? applyFirstToQuery(query, connectionField, first)
-        : query;
+      options.first ?? extractFirstFromQuery(query, connectionField);
 
-    let response = await this.fetchImpl("https://api.github.com/graphql", {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ query: effectiveQuery, variables }),
+    let attempt = await this.rawGraphql(query, variables, {
+      first,
+      retried502: options.retried502,
+      connectionField,
     });
 
-    if (response.status === 403 || response.status === 429) {
-      await this.waitForHttpRateLimit(response);
-      response = await this.fetchImpl("https://api.github.com/graphql", {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify({ query: effectiveQuery, variables }),
-      });
+    if (attempt.classification === "secondary_rate_limit") {
+      const backoffIdx = options.secondaryAttempt ?? 0;
+      if (backoffIdx < SECONDARY_BACKOFF_MS.length) {
+        await this.chunkedSleep(
+          attempt.retryAfterMs ?? SECONDARY_BACKOFF_MS[backoffIdx],
+        );
+        return this.graphql(query, variables, {
+          ...options,
+          secondaryAttempt: backoffIdx + 1,
+        });
+      }
     }
 
-    if (
-      (response.status === 502 || response.status === 504) &&
-      !options.retried502
-    ) {
+    if (attempt.classification === "timeout" && !options.retried502) {
       await this.sleep(2000);
       return this.graphql(query, variables, {
         first,
         retried502: true,
         connectionField,
+        secondaryAttempt: options.secondaryAttempt,
       });
     }
 
     if (
-      (response.status === 502 || response.status === 504) &&
+      attempt.classification === "timeout" &&
       options.retried502 &&
       first !== undefined &&
-      first > 10
+      first > 10 &&
+      connectionField
     ) {
       const halved = Math.max(10, Math.floor(first / 2));
       return this.graphql(query, variables, {
         first: halved,
         retried502: false,
         connectionField,
+        secondaryAttempt: options.secondaryAttempt,
       });
     }
 
-    const body = (await response.json()) as GraphQLResult & Record<string, unknown>;
-    const rateLimit =
-      this.extractRateLimit(body) ??
-      (body.data
-        ? ((body.data as Record<string, unknown>).rateLimit as GraphQLResult["rateLimit"])
-        : undefined);
-    if (rateLimit) {
-      await this.waitForRateLimit(rateLimit.remaining, rateLimit.resetAt);
-    }
-
-    return { httpStatus: response.status, body };
+    return { httpStatus: attempt.httpStatus, body: attempt.body };
   }
 
-  async graphqlWithRetry(
+  async executeRequest(
     query: string,
     variables: Record<string, unknown> = {},
-    connectionField?: string,
-  ): Promise<{
-    success: boolean;
-    httpStatus: number;
-    payload: unknown;
-  }> {
+    options: {
+      connectionField?: string;
+      isQ1?: boolean;
+      nodesBatch?: boolean;
+    } = {},
+  ): Promise<RequestOutcome> {
+    if (!options.isQ1 && this.shouldStopForRemainingFloor()) {
+      return {
+        success: false,
+        httpStatus: 0,
+        payload: null,
+        classification: "primary_rate_limit",
+        stoppedRemainingFloor: true,
+      };
+    }
+
+    const connectionField = options.connectionField;
     const first = extractFirstFromQuery(query, connectionField);
-    let attempt = await this.graphql(query, variables, { first, connectionField });
-    const hasErrors =
-      Array.isArray(attempt.body.errors) && attempt.body.errors.length > 0;
+    let secondaryAttempt = 0;
 
-    if (!hasErrors && attempt.httpStatus < 400) {
-      return { success: true, httpStatus: attempt.httpStatus, payload: attempt.body };
-    }
-
-    await this.sleep(2000);
-    attempt = await this.graphql(query, variables, { first, connectionField });
-    const secondHasErrors =
-      Array.isArray(attempt.body.errors) && attempt.body.errors.length > 0;
-
-    if (!secondHasErrors && attempt.httpStatus < 400) {
-      return { success: true, httpStatus: attempt.httpStatus, payload: attempt.body };
-    }
-
-    return {
-      success: false,
-      httpStatus: attempt.httpStatus,
-      payload: attempt.body,
-    };
-  }
-
-  async restGet(path: string): Promise<{
-    httpStatus: number;
-    payload: unknown;
-    parseError: boolean;
-  }> {
-    const url = path.startsWith("https://")
-      ? path
-      : `https://api.github.com${path.startsWith("/") ? path : `/${path}`}`;
-
-    let response = await this.fetchImpl(url, {
-      method: "GET",
-      headers: this.headers(),
-    });
-
-    if (response.status === 403 || response.status === 429) {
-      await this.waitForHttpRateLimit(response);
-      response = await this.fetchImpl(url, {
-        method: "GET",
-        headers: this.headers(),
+    while (true) {
+      let attempt = await this.rawGraphql(query, variables, {
+        first,
+        connectionField,
       });
-    }
 
-    let payload: unknown;
-    let parseError = false;
-    const text = await response.text();
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = null;
-      parseError = true;
-    }
+      if (attempt.classification === "primary_rate_limit") {
+        return {
+          success: false,
+          httpStatus: attempt.httpStatus,
+          payload: attempt.body,
+          classification: "primary_rate_limit",
+        };
+      }
 
-    return { httpStatus: response.status, payload, parseError };
+      if (attempt.classification === "validation_1year") {
+        return {
+          success: false,
+          httpStatus: attempt.httpStatus,
+          payload: attempt.body,
+          classification: "validation_1year",
+        };
+      }
+
+      if (attempt.classification === "secondary_rate_limit") {
+        if (secondaryAttempt >= SECONDARY_BACKOFF_MS.length) {
+          return {
+            success: false,
+            httpStatus: attempt.httpStatus,
+            payload: attempt.body,
+            classification: "secondary_rate_limit",
+            secondaryExhausted: true,
+          };
+        }
+        await this.chunkedSleep(
+          attempt.retryAfterMs ?? SECONDARY_BACKOFF_MS[secondaryAttempt],
+        );
+        secondaryAttempt++;
+        continue;
+      }
+
+      if (attempt.classification === "timeout") {
+        await this.sleep(2000);
+        attempt = await this.rawGraphql(query, variables, {
+          first,
+          retried502: true,
+          connectionField,
+        });
+
+        if (attempt.classification === "timeout") {
+          if (first !== undefined && first > 10 && connectionField) {
+            const halved = Math.max(10, Math.floor(first / 2));
+            attempt = await this.rawGraphql(query, variables, {
+              first: halved,
+              connectionField,
+            });
+          }
+          if (attempt.classification === "timeout") {
+            return {
+              success: false,
+              httpStatus: attempt.httpStatus,
+              payload: attempt.body,
+              classification: "timeout",
+            };
+          }
+        }
+      }
+
+      const nodesNull =
+        options.nodesBatch &&
+        (attempt.classification === "null_data" ||
+          (attempt.body.data != null && nodesFieldIsNull(attempt.body)));
+
+      if (nodesNull || attempt.classification === "null_data") {
+        await this.sleep(2000);
+        const retry = await this.rawGraphql(query, variables, {
+          first,
+          connectionField,
+        });
+        if (retry.classification === "primary_rate_limit") {
+          return {
+            success: false,
+            httpStatus: retry.httpStatus,
+            payload: retry.body,
+            classification: "primary_rate_limit",
+          };
+        }
+        if (retry.classification === "validation_1year") {
+          return {
+            success: false,
+            httpStatus: retry.httpStatus,
+            payload: retry.body,
+            classification: "validation_1year",
+          };
+        }
+        if (retry.classification === "secondary_rate_limit") {
+          continue;
+        }
+        const retryNodesNull =
+          options.nodesBatch &&
+          (retry.classification === "null_data" ||
+            (retry.body.data != null && nodesFieldIsNull(retry.body)));
+        if (
+          retry.classification === "null_data" ||
+          retry.body.data == null ||
+          retryNodesNull
+        ) {
+          return {
+            success: false,
+            httpStatus: retry.httpStatus,
+            payload: retry.body,
+            classification: "null_data",
+          };
+        }
+        attempt = retry;
+      }
+
+      if (attempt.classification === "secondary_rate_limit") {
+        continue;
+      }
+
+      if (
+        attempt.classification === "partial_data" ||
+        attempt.classification === "success"
+      ) {
+        return {
+          success: attempt.classification === "success",
+          httpStatus: attempt.httpStatus,
+          payload: attempt.body,
+          classification: attempt.classification,
+        };
+      }
+
+      return {
+        success: false,
+        httpStatus: attempt.httpStatus,
+        payload: attempt.body,
+        classification: attempt.classification,
+      };
+    }
   }
-}
-
-export interface PageInfo {
-  hasNextPage: boolean;
-  endCursor: string | null;
 }
 
 export function getNested(obj: unknown, path: string[]): unknown {
@@ -330,108 +590,15 @@ export function getNested(obj: unknown, path: string[]): unknown {
   return current;
 }
 
-export async function paginateConnection(
-  client: GitHubClient,
-  store: Store,
-  ingestRunId: number,
-  queryName: string,
-  query: string,
-  baseVariables: Record<string, unknown>,
-  connectionPath: string[],
-  options: {
-    notASignal?: boolean;
-    metadata?: Record<string, unknown>;
-    onPage?: (payload: unknown) => void;
-  } = {},
-): Promise<{ success: boolean; pages: number }> {
-  let after: string | null = null;
-  let pages = 0;
-  let hasNextPage = true;
-  const connectionField = connectionPath[connectionPath.length - 1];
-  const first = extractFirstFromQuery(query, connectionField);
-
-  while (hasNextPage) {
-    const variables = { ...baseVariables, after };
-
-    let attempt = await client.graphql(query, variables, { first, connectionField });
-    store.insertIngestResponse({
-      ingestRunId,
-      fetchedAt: new Date().toISOString(),
-      queryName,
-      variables,
-      httpStatus: attempt.httpStatus,
-      payload: attempt.body,
-      notASignal: options.notASignal,
-      metadata: options.metadata,
-    });
-    store.touchIngestRunHeartbeat(ingestRunId);
-    pages++;
-
-    let hasErrors =
-      Array.isArray(attempt.body.errors) && attempt.body.errors.length > 0;
-
-    if (hasErrors || attempt.httpStatus >= 400) {
-      await client.delay(2000);
-      attempt = await client.graphql(query, variables, { first, connectionField });
-      store.insertIngestResponse({
-        ingestRunId,
-        fetchedAt: new Date().toISOString(),
-        queryName,
-        variables,
-        httpStatus: attempt.httpStatus,
-        payload: attempt.body,
-        notASignal: options.notASignal,
-        metadata: options.metadata,
-      });
-      store.touchIngestRunHeartbeat(ingestRunId);
-      pages++;
-      hasErrors =
-        Array.isArray(attempt.body.errors) && attempt.body.errors.length > 0;
-      if (hasErrors || attempt.httpStatus >= 400) {
-        return { success: false, pages };
-      }
-    }
-
-    options.onPage?.(attempt.body);
-
-    const data = (attempt.body as GraphQLResult).data;
-    const parentPath = connectionPath.slice(0, -1);
-
-    if (parentPath.length > 0) {
-      const parent = getNested(data, parentPath);
-      if (parent == null) {
-        return { success: false, pages };
-      }
-    }
-
-    const connection = getNested(data, connectionPath) as
-      | { pageInfo?: PageInfo; nodes?: unknown[] }
-      | undefined;
-
-    if (!connection) {
-      return { success: false, pages };
-    }
-
-    const nodes = connection.nodes ?? [];
-    if (nodes.length === 0) break;
-
-    const pageInfo = connection.pageInfo;
-    hasNextPage = pageInfo?.hasNextPage ?? false;
-    after = pageInfo?.endCursor ?? null;
-    if (!hasNextPage) break;
+export function chunkIds<T>(ids: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < ids.length; i += size) {
+    chunks.push(ids.slice(i, i + size));
   }
-
-  return { success: true, pages };
+  return chunks;
 }
 
 export function payloadContainsToken(payload: unknown, token: string): boolean {
   const json = JSON.stringify(payload);
   return json.includes(token);
-}
-
-export function isRestFailure(result: {
-  httpStatus: number;
-  parseError: boolean;
-}): boolean {
-  return result.httpStatus >= 400 || result.parseError;
 }

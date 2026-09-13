@@ -163,7 +163,7 @@ export class Store {
     const hasResponse = this.db.prepare(
       `SELECT 1 FROM ingest_responses
        WHERE ingest_run_id = ?
-         AND (query_name GLOB 'Q[0-9]*' OR query_name = 'rest_commit_files')
+         AND query_name GLOB 'Q[0-9]*'
        LIMIT 1`,
     );
     const update = this.db.prepare(
@@ -241,6 +241,32 @@ export class Store {
         "UPDATE ingest_runs SET github_user_id = ?, github_login = ? WHERE id = ?",
       )
       .run(githubUserId, githubLogin, id);
+  }
+
+  updateIngestRunWindow(id: number, windowStart: string): void {
+    this.db
+      .prepare("UPDATE ingest_runs SET window_start = ? WHERE id = ?")
+      .run(windowStart, id);
+  }
+
+  updateIngestRunSubsets(
+    id: number,
+    subsets: {
+      hydratePrIds: string[];
+      q9PrIds: string[];
+      q13PrIds: string[];
+    },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE ingest_runs SET hydrate_pr_ids = ?, q9_pr_ids = ?, q13_pr_ids = ? WHERE id = ?`,
+      )
+      .run(
+        JSON.stringify(subsets.hydratePrIds),
+        JSON.stringify(subsets.q9PrIds),
+        JSON.stringify(subsets.q13PrIds),
+        id,
+      );
   }
 
   insertIngestResponse(params: {
