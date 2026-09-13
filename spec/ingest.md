@@ -27,6 +27,16 @@ Private work appears only if the user grants `repo` and the token can see that r
 
 Register a **GitHub OAuth App** (not a GitHub App). Homepage + callback URL are ours.
 
+Credentials live in `.env` (gitignored). Names:
+
+```
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+GITHUB_REDIRECT_URI=http://127.0.0.1:3000/auth/github/callback
+```
+
+`.env.example` is the committed template. Never commit `.env` or the client secret.
+
 ### Scopes (exact string)
 
 ```
